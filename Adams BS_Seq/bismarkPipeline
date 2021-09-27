@@ -1,0 +1,308 @@
+#!/bin/bash
+
+export LC_ALL=C
+
+command -v cutadapt >/dev/null 2>&1 || { echo >&2 "I require cutadapt but it's not installed.  Aborting."; exit 1; }
+command -v parallel >/dev/null 2>&1 || { echo >&2 "I require parallel but it's not installed.  Aborting."; exit 1; }
+command -v python >/dev/null 2>&1 || { echo >&2 "I require python but it's not installed.  Aborting."; exit 1; }
+command -v pigz >/dev/null 2>&1 || { echo >&2 "I require pigz but it's not installed.  Aborting."; exit 1; }
+
+if [ $# -eq 4 ]
+then
+	# nothing at the moment
+	echo "No M-bias cutuff supplied. Using 5bp."
+	export mbiascutoff="5"
+elif [ $# -eq 5 ]
+then
+	echo "Using M-bias cutoff of: $5"
+	export mbiascutoff=$5
+else
+	echo 'usage: bismarkPipeline <mapdirectory> <bismark_index> <quals> <threads> <M-bias cutoff>'
+	echo "available quals: auto, phred33-quals, phred64-quals, solexa-quals, solexa1.3-quals, integer-quals"
+	exit 1
+fi
+
+export PYTHONPATH="/mnt/50tb/repository/shared/baselib/:."
+
+export bowtiepath="/mnt/50tb/repository/3rdparty/bowtie2/bowtie2-2.1.0/"
+export bismarkpath="/mnt/50tb/repository/3rdparty/bismark_v0.10.1/bismark"
+export deduplicatepath="/mnt/50tb/repository/3rdparty/bismark_v0.10.1/deduplicate_bismark"
+export methylationextractor="/mnt/50tb/repository/3rdparty/bismark_v0.10.1/bismark_methylation_extractor"
+
+export fastqdetectpath="/mnt/50tb/repository/shared/tools/fastq/fastq-detect.py"
+
+export markduplicatespath="/mnt/50tb/repository/3rdparty/picard/picard-tools-1.98/picard-tools-1.98/MarkDuplicates.jar"
+export trimgalore="/mnt/50tb/repository/3rdparty/trim_galore_v0.3.0/trim_galore"
+export fastqc="/mnt/50tb/repository/3rdparty/fastqc/FastQC/fastqc"
+
+export samtoolspath="/mnt/50tb/repository/3rdparty/samtools/samtools-0.1.19/"
+
+export rootdir=$1
+export bismarkindex=$2
+export quals=$3
+export threads=$4
+
+echo $0 $@ > "$1/args-`date +\"%F.%X\"`"
+
+# save this script to the directory (record version used)
+cp $0 $1/
+
+# move all the fastq files into the sequences directory
+if [ -d $1/sequences ];
+then
+	echo "Sequences data folder already exists - Not moving to sequences folder";
+else
+	# rename any .txt files into .fastq
+	rename 's/.txt/.fastq/' $1/*.txt*
+	
+	rename 's/.fq/.fastq/' $1/*.fq*
+
+	mkdir $1/sequences
+	mv $1/*.fastq $1/sequences/
+	mv $1/*.fastq.gz $1/sequences/
+fi
+
+# if the quality folder already exists we can skip, otherwise call FastQC
+if [ -d $1/quality ];
+then
+	echo "Quality data folder already exists - Not quality checking";
+else
+	echo "Quality reports"
+	mkdir $1/quality
+	$fastqc --nogroup --threads $threads --contaminants /mnt/50tb/repository/3rdparty/fastqc/FastQC/Contaminants/contaminant_list.txt -f fastq $1/sequences/*.fastq $1/sequences/*.fastq.gz
+	mv $1/sequences/*fastqc* $1/quality/
+fi
+
+if [ -d $1/trimmed-seq ];
+then
+	echo "Trimmed sequence exists - Not trimming";
+else
+	mkdir $1/trimmed-seq
+
+	echo "Trimming sequences"
+
+	trimseq() {
+		# Args:
+		# $1 - path to file to be trimmed
+		# $2 - path for output
+
+		echo "Trimming $quals"
+
+		if [ $quals == "auto" ];
+		then
+			qual="`python $fastqdetectpath --fastq $1`"
+
+			# solexa quals is actually phred64 here
+			if [ $qual == "solexa" ];
+			then
+				qual="phred64"
+			fi
+		else
+			qual=$quals
+		fi
+		
+		one=$1
+		two=`echo $1 | sed "s/_1/_2/"`
+
+		if [ -f $two ]
+		then
+			$trimgalore --quality 20 --$qual --paired --suppress_warn --retain_unpaired $one $two --output_dir $2
+		else
+			$trimgalore --quality 20 --$qual --suppress_warn $one --output_dir $2
+		fi
+	}
+	export -f trimseq
+
+	parallel --progress -j $threads trimseq ::: $1/sequences/*_1*.fastq* ::: $1/trimmed-seq
+
+	if [ -d $1/trimmed-seq/unpaired ];
+	then
+		echo "Not making unpaired folder"
+	else
+		mkdir $1/trimmed-seq/unpaired
+	fi
+
+	mv $1/trimmed-seq/*unpaired*fq* $1/trimmed-seq/unpaired/
+
+	rename 's/_val_[12].fq/.fastq/' $1/trimmed-seq/*fq*
+	rename 's/_trimmed.fq/.fastq/' $1/trimmed-seq/*fq*
+
+	if [ -d $1/logs ];
+	then
+		echo "Logs folder exists"
+	else
+		mkdir $1/logs
+	fi
+	mv $1/trimmed-seq/*trimming_report.txt $1/logs/
+	
+fi
+
+
+# do the alignment
+if [ -d $1/alignments ];
+then
+	echo "Alignments folder already exists - Not aligning";
+else
+	mkdir $1/alignments
+
+	for i in $1/trimmed-seq/*_1*.fastq*
+	do
+		bismarklog="$i.bismark.log"
+
+		date > $bismarklog
+		
+		$bismarkpath --version >> $bismarklog
+
+		if [ $quals == "auto" ];
+		then
+			# note we use the original fastq file for quality detection as we might change the score distribution by trimming
+			# i.e. only retain high scoring reads all of which have scores in the phred64 range even though it's actually phred33
+			basename=${i##*/}
+			qual="`python $fastqdetectpath --fastq $1/sequences/$basename`"
+		else
+			qual=$quals
+		fi
+
+		qual=$qual"-quals"
+
+		echo "Using quality: $qual"
+
+		one=$i
+		two=`echo $one | sed "s/_1/_2/"`
+		none=`echo $one | sed "s/_1//" | sed "s/.fastq//" | sed "s/.gz//" | sed "s/.*\///"`
+
+		echo $none
+
+		outputfolder="$1/alignments/$none"
+		mkdir $outputfolder
+		
+		# bismark uses twice as many threads as you specify as it launches 2 copies of bowtie with this number of threads each
+		# we want half the number of threads asked for, rounding down, with a min of 1
+		bismarkthreads=`calc "max(floor($threads/2),1)"`
+
+		if [ -f $two ]
+		then
+			bismarkcmd="$bismarkpath --$qual --bowtie2 -p $bismarkthreads --gzip --bam --path_to_bowtie $bowtiepath --samtools_path $samtoolspath --output_dir $outputfolder --unmapped --ambiguous $bismarkindex -1 $one -2 $two"
+		else
+			bismarkcmd="$bismarkpath --$qual --bowtie2 -p $bismarkthreads --gzip --bam --path_to_bowtie $bowtiepath --samtools_path $samtoolspath --output_dir $outputfolder --unmapped --ambiguous $bismarkindex $one"
+		fi
+		
+		echo $bismarkcmd >> $bismarklog
+		echo "***"
+		echo $bismarkcmd
+		echo "***"
+		$bismarkcmd &>> $bismarklog
+	done
+
+	# move bismark logs to logs folder
+	if [ -d $1/logs ];
+	then
+		echo "Logs folder exists"
+	else
+		mkdir $1/logs
+	fi
+	mv $1/trimmed-seq/*log $1/logs/
+fi
+
+if [ -a $1/.unalignedcompressed ];
+then
+	echo "Unaligned files compressed already"
+else
+	echo "Compressing unmapped and ambiguous reads"
+
+	pigz $1/alignments/*/*ambiguous*
+	pigz $1/alignments/*/*unmapped*
+	
+	touch $1/.unalignedcompressed
+fi
+
+
+if [ -a $1/.unconvertedremoved ];
+then
+	echo "Unconverted reads already removed"
+else
+	echo "Removing unconverted reads"
+	removeunconverted(){
+		# Args:
+		# $1 - path to bam file to remove unconverted reads from
+		samtools view -H $1 > $1.unconvertedremoved.sam
+		samtools view $1 | awk '{
+		   # left read
+		   if (index($14, "XM:Z:") != 1) {print "SAM format looks changed, XM field not in col 14" > "/dev/stderr";exit 1;}
+		   leftname = $1
+		   left = $0;
+		   countl = split(substr($14,6),a,"[HX]") - 1;
+		
+		   getline;
+		
+		   # right read
+		   if (index($14, "XM:Z:") != 1) {print "SAM format looks changed, XM field not in col 14" > "/dev/stderr";exit 1;}
+		   if (leftname != $1) {print "Reads improperly paired. Names not matching." > "/dev/stderr";exit 1;}
+		   countr = split(substr($14,6),a,"[HX]") - 1;
+		
+		   if (countl <= 3 && countr <= 3) { print left; print; }
+		}' >> $1.unconvertedremoved.sam
+	}
+	export -f removeunconverted
+
+	parallel --progress -j $threads removeunconverted ::: $1/alignments/*/*.bam
+	touch $1/.unconvertedremoved
+fi
+
+
+if [ -a $1/.deduplicated ];
+then
+	echo "Duplicate reads already removed"
+else
+	# this is a memory hog (15GB+ / instance), limit to 2 dedups at a time, or less if threads is less
+	dedupthreads=`calc "min(int($threads),2)"`
+
+	echo "Removing duplicate reads"
+	removeduplicates(){
+		# Args:
+		# $1 - path to sam file to remove unconverted reads from
+		$deduplicatepath --bam --samtools_path $samtoolspath "$1"
+	}
+	export -f removeduplicates
+
+	parallel --progress -j $dedupthreads removeduplicates ::: $1/alignments/*/*unconvertedremoved.sam
+	rm $1/alignments/*/*.unconvertedremoved.sam
+	touch $1/.deduplicated
+fi
+
+if [ -d $1/meth ];
+then
+	echo "Meth data extracted already"
+else
+	echo "Extracting methylation data"
+	mkdir $1/meth
+
+	methextract(){
+		# Args:
+		# $1 - path to bam file to extract meth data from
+		$methylationextractor --no_overlap --comprehensive --samtools_path $samtoolspath --gzip --ignore_r2 $mbiascutoff --output $rootdir/meth $1
+	}
+	export -f methextract
+
+	parallel --progress -j $threads methextract ::: $1/alignments/*/*unconvertedremoved.deduplicated.bam
+fi
+
+if [ -d $1/lambda ];
+then
+	echo "Lambda error rates calculated already"
+else
+	echo "Calculating Lambda error rates"
+
+	mkdir $1/lambda
+
+	lambdacount(){
+		# Args:
+		# $1 - file name of meth extracted files to count number of lambda reads from
+		file=`echo $1 | sed "s/$rootdir\/meth\///g" | sed 's/.gz$//'`
+		echo "Total Methylated" > $rootdir/lambda/$file
+		zcat $1 | grep -F chrLambda | awk 'BEGIN{total = 0; meth = 0 }{ total += 1; if ($5 ~ /[A-Z]/) { meth += 1} } END {print total,meth }' >> $rootdir/lambda/$file
+	}
+	export -f lambdacount
+
+	parallel --progress -j $threads lambdacount ::: $1/meth/*.unconvertedremoved.deduplicated.txt.gz
+fi
